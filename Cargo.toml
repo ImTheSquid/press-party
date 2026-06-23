@@ -1,10 +1,11 @@
 [package]
 name = "press-party"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Jack Hogan <jackhogan11@gmail.com>"]
 description = "Assign metadata and album art to music, with batch processing and in-terminal image preview"
+repository = "https://github.com/ImTheSquid/press-party"
 
 [dependencies]
 anyhow = "1"
