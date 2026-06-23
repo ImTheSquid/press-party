@@ -195,10 +195,19 @@ fn highlight_style(focused: bool) -> Style {
 }
 
 fn draw_preview(f: &mut Frame, area: Rect, app: &mut App) {
+    // The preview reflects focus: the image to assign, or the cursored track's
+    // embedded cover. Title says which so the source is never ambiguous.
+    let title = match app.focus {
+        Focus::Images => " PREVIEW ".to_string(),
+        Focus::Tracks => match app.current_track() {
+            Some(t) => format!(" PREVIEW · {} (embedded) ", t.title),
+            None => " PREVIEW ".to_string(),
+        },
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::DarkGray))
-        .title(" PREVIEW ");
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -211,32 +220,71 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &mut App) {
     draw_preview_info(f, info_area, app);
 
     // Image side (mutable borrow of the cached protocol).
+    let loading = app.preview_loading.is_some();
+    let failed = app.current_preview_failed();
+    let empty = app.current_preview_empty();
+    let on_tracks = app.focus == Focus::Tracks;
     if let Some(preview) = app.preview.as_mut() {
         let widget = StatefulImage::default().resize(Resize::Fit(None));
         f.render_stateful_widget(widget, image_area, &mut preview.protocol);
     } else {
-        let msg = Paragraph::new("no image selected")
+        // No image to draw. A graphics-protocol bitmap (iTerm2/kitty/sixel) from
+        // a previous frame persists until its cells are overwritten, so wipe the
+        // whole area with Clear — a short placeholder Paragraph alone would leave
+        // most cells untouched and the old cover would linger.
+        f.render_widget(Clear, image_area);
+        let msg = if failed {
+            "failed to load image"
+        } else if empty {
+            "no embedded art"
+        } else if loading {
+            "loading…"
+        } else if on_tracks {
+            "no track selected"
+        } else {
+            "no image selected"
+        };
+        let para = Paragraph::new(msg)
             .style(Style::new().fg(Color::DarkGray))
             .wrap(Wrap { trim: true });
-        f.render_widget(msg, image_area);
+        f.render_widget(para, image_area);
     }
 }
 
 fn draw_preview_info(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
-    match app.current_image() {
-        Some(img) => {
-            lines.push(Line::styled(
-                img.name.clone(),
-                Style::new().bold().fg(Color::Cyan),
-            ));
-            let dims = img
-                .dims
-                .map(|(w, h)| format!("{w}×{h}"))
-                .unwrap_or_else(|| "unknown".into());
-            lines.push(Line::from(format!("{dims}   {}", format_size(img.size))));
-        }
-        None => lines.push(Line::styled("no image", Style::new().fg(Color::DarkGray))),
+    match app.focus {
+        // On IMAGES: describe the image file being previewed (the one to assign).
+        Focus::Images => match app.current_image() {
+            Some(img) => {
+                lines.push(Line::styled(
+                    img.name.clone(),
+                    Style::new().bold().fg(Color::Cyan),
+                ));
+                let dims = img
+                    .dims
+                    .map(|(w, h)| format!("{w}×{h}"))
+                    .unwrap_or_else(|| "unknown".into());
+                lines.push(Line::from(format!("{dims}   {}", format_size(img.size))));
+            }
+            None => lines.push(Line::styled("no image", Style::new().fg(Color::DarkGray))),
+        },
+        // On TRACKS: describe the cursored track whose embedded cover we show.
+        Focus::Tracks => match app.current_track() {
+            Some(t) => {
+                lines.push(Line::styled(
+                    t.title.clone(),
+                    Style::new().bold().fg(Color::Cyan),
+                ));
+                let art = if t.art_count > 0 {
+                    format!("{} embedded", t.art_count)
+                } else {
+                    "no cover".to_string()
+                };
+                lines.push(Line::from(format!("[{}]   {art}", t.format)));
+            }
+            None => lines.push(Line::styled("no track", Style::new().fg(Color::DarkGray))),
+        },
     }
     lines.push(Line::from(""));
 

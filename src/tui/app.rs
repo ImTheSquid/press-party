@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
-use crate::art::Art;
 use crate::meta::Plan;
 
 use super::data::{ImageRow, TrackRow, image_visible, load_rows, rescan, track_visible};
+use super::preview::{Decoded, PreviewLoader, Source, SourceRead, read_source};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -151,10 +151,14 @@ pub struct PendingBatch {
 }
 
 /// Cached terminal-graphics protocol for the currently previewed image. Rebuilt
-/// only when the image-column cursor moves to a different file.
+/// only when the preview source changes.
 pub struct Preview {
-    pub path: PathBuf,
+    pub source: Source,
     pub protocol: StatefulProtocol,
+    /// Content hash of the displayed image, so switching to a different source
+    /// with identical content (e.g. another track off the same album) can keep
+    /// the current image instead of clearing and re-decoding it.
+    pub hash: u64,
 }
 
 pub struct App {
@@ -172,6 +176,14 @@ pub struct App {
 
     pub picker: Picker,
     pub preview: Option<Preview>,
+    /// Source the background loader is currently decoding, if any. Drives the
+    /// "loading…" placeholder and a tighter poll interval while in flight.
+    pub preview_loading: Option<Source>,
+    /// Sources that failed to decode, so we don't request them again each frame.
+    pub preview_failed: HashSet<Source>,
+    /// Sources that resolved with no image (e.g. a track with no embedded art).
+    pub preview_empty: HashSet<Source>,
+    pub loader: PreviewLoader,
 
     pub status: StatusLine,
     pub pending: Option<PendingBatch>,
@@ -197,6 +209,10 @@ impl App {
             backup: true,
             picker,
             preview: None,
+            preview_loading: None,
+            preview_failed: HashSet::new(),
+            preview_empty: HashSet::new(),
+            loader: PreviewLoader::new(),
             status: StatusLine::default(),
             pending: None,
             edit: None,
@@ -228,6 +244,9 @@ impl App {
         let existing: HashSet<&str> = self.tracks.iter().map(|r| r.id.as_str()).collect();
         self.trk_col.selected.retain(|id| existing.contains(id.as_str()));
         self.preview = None;
+        self.preview_loading = None;
+        self.preview_failed.clear();
+        self.preview_empty.clear();
         self.recompute_visible();
         Ok(())
     }
@@ -315,41 +334,116 @@ impl App {
         })
     }
 
-    /// Rebuild the cached preview protocol if the cursored image changed.
+    /// What the preview pane should show, driven by focus: the cursored image
+    /// file when on the IMAGES column, or the cursored track's embedded cover
+    /// when on the TRACKS column.
+    pub fn preview_target(&self) -> Option<Source> {
+        match self.focus {
+            Focus::Images => self.current_image().map(|i| Source::ImageFile(i.path.clone())),
+            Focus::Tracks => self.current_track().map(|t| Source::EmbeddedArt(t.path.clone())),
+        }
+    }
+
+    /// React to a change in the preview target. Reading the encoded bytes is
+    /// cheap, so we do it synchronously and hash the content: if it's identical
+    /// to what's already on screen (the common "whole album shares one cover"
+    /// case) we keep the current image untouched; otherwise we clear it
+    /// immediately — so the stale image never lingers — and decode async.
     pub fn sync_preview(&mut self) {
-        let Some(img) = self.current_image() else {
+        let Some(target) = self.preview_target() else {
             self.preview = None;
+            self.preview_loading = None;
             return;
         };
-        let path = img.path.clone();
-        if self.preview.as_ref().map(|p| &p.path) == Some(&path) {
+        // Already showing exactly this source, or already decoding it: nothing
+        // to do.
+        if self.preview.as_ref().map(|p| &p.source) == Some(&target)
+            || self.preview_loading.as_ref() == Some(&target)
+        {
             return;
         }
-        match Art::load(&path).and_then(|art| {
-            image::load_from_memory(&art.bytes).map_err(anyhow::Error::from)
-        }) {
-            Ok(dyn_img) => {
-                let protocol = self.picker.new_resize_protocol(downscale_for_preview(dyn_img));
-                self.preview = Some(Preview { path, protocol });
+        // Known to have no image (or be unreadable): make sure nothing is shown.
+        // Crucially this clears whatever cover was on screen before — e.g. when
+        // tabbing from the IMAGES column onto an art-less track we've already
+        // visited — instead of leaving the previous image stuck.
+        if self.preview_failed.contains(&target) || self.preview_empty.contains(&target) {
+            self.preview = None;
+            self.preview_loading = None;
+            return;
+        }
+
+        match read_source(&target) {
+            SourceRead::Image(bytes, hash) => {
+                if self.preview.as_ref().map(|p| p.hash) == Some(hash) {
+                    // Identical content already displayed — keep it, just point
+                    // the preview at the new source so it counts as shown.
+                    if let Some(p) = self.preview.as_mut() {
+                        p.source = target;
+                    }
+                    self.preview_loading = None;
+                } else {
+                    // Different content: clear now, decode on the worker.
+                    self.preview = None;
+                    self.preview_loading = Some(target.clone());
+                    self.loader.request(target, bytes, hash);
+                }
             }
-            Err(_) => {
+            SourceRead::NoImage => {
                 self.preview = None;
+                self.preview_loading = None;
+                self.preview_empty.insert(target);
+            }
+            SourceRead::Error => {
+                self.preview = None;
+                self.preview_loading = None;
+                self.preview_failed.insert(target);
             }
         }
     }
-}
 
-/// Longest-side pixel cap for preview images. The preview pane is at most a few
-/// hundred pixels wide, so a 4000×4000 cover is pure waste — downscaling once
-/// here keeps every later re-encode (e.g. on modal close) cheap.
-const PREVIEW_MAX_PX: u32 = 900;
-
-fn downscale_for_preview(img: image::DynamicImage) -> image::DynamicImage {
-    use image::GenericImageView;
-    let (w, h) = img.dimensions();
-    if w <= PREVIEW_MAX_PX && h <= PREVIEW_MAX_PX {
-        return img;
+    /// Resolution of the current preview target, for the placeholder text.
+    pub fn current_preview_failed(&self) -> bool {
+        self.preview_target()
+            .is_some_and(|t| self.preview_failed.contains(&t))
     }
-    // `thumbnail` preserves aspect ratio and uses a fast linear filter.
-    img.thumbnail(PREVIEW_MAX_PX, PREVIEW_MAX_PX)
+
+    pub fn current_preview_empty(&self) -> bool {
+        self.preview_target()
+            .is_some_and(|t| self.preview_empty.contains(&t))
+    }
+
+    /// Drain finished decodes from the loader. Adopts a result only if it's
+    /// still for the current target; stale results (cursor moved on) are
+    /// dropped. Returns true if the preview changed and a redraw is warranted.
+    pub fn poll_preview(&mut self) -> bool {
+        let current = self.preview_target();
+        let mut changed = false;
+        while let Some(decoded) = self.loader.try_recv() {
+            match decoded {
+                Decoded::Ok(source, img, hash) => {
+                    if current.as_ref() == Some(&source) {
+                        let protocol = self.picker.new_resize_protocol(img);
+                        self.preview = Some(Preview {
+                            source,
+                            protocol,
+                            hash,
+                        });
+                        self.preview_loading = None;
+                        changed = true;
+                    }
+                }
+                Decoded::Err(source) => {
+                    if self.preview_loading.as_ref() == Some(&source) {
+                        self.preview_loading = None;
+                    }
+                    if current.as_ref() == Some(&source) {
+                        self.preview = None;
+                        changed = true;
+                    }
+                    self.preview_failed.insert(source);
+                }
+            }
+        }
+        changed
+    }
 }

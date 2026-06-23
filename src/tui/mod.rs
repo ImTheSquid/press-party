@@ -1,6 +1,7 @@
 pub mod app;
 pub mod data;
 pub mod events;
+pub mod preview;
 pub mod render;
 
 use std::io;
@@ -39,10 +40,32 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
     let mut was_modal = false;
+    // Content hash of the image currently painted on the physical screen. A
+    // graphics-protocol bitmap (iTerm2/kitty/sixel) persists until the screen is
+    // truly cleared — blanking ratatui cells isn't enough — so when the shown
+    // image goes away or changes we force a full repaint. Keyed by hash, not
+    // source, so navigating tracks that share one cover never triggers it.
+    let mut shown_hash: Option<u64> = None;
     while !app.should_quit {
         app.sync_preview();
+        app.poll_preview();
+
+        let current_hash = app.preview.as_ref().map(|p| p.hash);
+        if shown_hash.is_some() && current_hash != shown_hash {
+            terminal.clear()?;
+        }
+        shown_hash = current_hash;
+
         terminal.draw(|f| render::draw(f, app))?;
-        if event::poll(Duration::from_millis(250))? {
+
+        // Poll input briefly while a decode is in flight so the image appears
+        // promptly when the worker finishes; idle otherwise to stay cheap.
+        let timeout = if app.preview_loading.is_some() {
+            Duration::from_millis(30)
+        } else {
+            Duration::from_millis(250)
+        };
+        if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 events::handle_key(app, key);
             }
